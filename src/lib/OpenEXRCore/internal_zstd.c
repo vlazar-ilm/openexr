@@ -48,10 +48,10 @@ exr_zstd_shuffle_encode_4 (const uint8_t* in, size_t size, uint8_t* out);
 extern void
 exr_zstd_shuffle_encode_2 (const uint8_t* in, size_t size, uint8_t* out);
 
-extern void delta_encode_row_u16 (uint8_t* p, uint64_t n);
-extern void delta_decode_row_u16 (uint8_t* p, uint64_t n);
-extern void delta_encode_row_u32 (uint8_t* p, uint64_t n);
-extern void delta_decode_row_u32 (uint8_t* p, uint64_t n);
+extern void delta_encode_row_u16 (uint8_t* dst, const uint8_t* src, uint64_t n);
+extern void delta_decode_row_u16 (uint8_t* dst, const uint8_t* src, uint64_t n);
+extern void delta_encode_row_u32 (uint8_t* dst, const uint8_t* src, uint64_t n);
+extern void delta_decode_row_u32 (uint8_t* dst, const uint8_t* src, uint64_t n);
 
 #define RETURN_ERRORV(pipeline, err_code, msg, ...)                            \
     {                                                                          \
@@ -274,10 +274,34 @@ compute_sorting_lookup (
     return splitPoint;
 }
 
-/** Apply delta along samples within each channel row (layout from compute_sorting_lookup). */
+/** True when the packed layout already equals the sorted layout, so sort2 is a
+ *  pure copy and can be skipped. That happens exactly when the chunk is a single
+ *  line (height == 1) and, scanning channels in index order, no 2-byte (half)
+ *  channel appears after any 4-byte (float) channel. Channels here are only ever
+ *  2 or 4 bytes (HALF=2, FLOAT/UINT=4). */
+static bool
+exr_zstd_layout_is_identity (
+    const exr_coding_channel_info_t* channels, int channelsSize, int height)
+{
+    if (height != 1) return false;
+    bool seen_four = false;
+    for (int i = 0; i < channelsSize; ++i)
+    {
+        if (channels[i].bytes_per_element == 4)
+            seen_four = true;
+        else if (seen_four)
+            return false; /* a 2-byte channel after a 4-byte channel */
+    }
+    return true;
+}
+
+/** Apply delta along samples within each channel row (layout from
+ *  compute_sorting_lookup). Out-of-place: reads src, writes dst, advancing the
+ *  shared offset on both. Pass dst == src for in-place operation. */
 static int
 delta_encode_sorted_layout (
-    uint8_t*                         buf,
+    uint8_t*                         dst,
+    const uint8_t*                   src,
     uint64_t                         splitPoint,
     size_t                           total_bytes,
     const uint64_t*                  num_samples_grid,
@@ -292,7 +316,7 @@ delta_encode_sorted_layout (
         {
             if (channels[i].bytes_per_element != 2) continue;
             uint64_t const n = num_samples_grid[h * channelsSize + i];
-            if (n > 0) delta_encode_row_u16 (buf + off, n);
+            if (n > 0) delta_encode_row_u16 (dst + off, src + off, n);
             off += (size_t) n * 2u;
         }
     }
@@ -303,7 +327,7 @@ delta_encode_sorted_layout (
         {
             if (channels[i].bytes_per_element != 4) continue;
             uint64_t const n = num_samples_grid[h * channelsSize + i];
-            if (n > 0) delta_encode_row_u32 (buf + off, n);
+            if (n > 0) delta_encode_row_u32 (dst + off, src + off, n);
             off += (size_t) n * 4u;
         }
     }
@@ -313,7 +337,8 @@ delta_encode_sorted_layout (
 
 static int
 delta_decode_sorted_layout (
-    uint8_t*                         buf,
+    uint8_t*                         dst,
+    const uint8_t*                   src,
     uint64_t                         splitPoint,
     size_t                           total_bytes,
     const uint64_t*                  num_samples_grid,
@@ -328,7 +353,7 @@ delta_decode_sorted_layout (
         {
             if (channels[i].bytes_per_element != 2) continue;
             uint64_t const n = num_samples_grid[h * channelsSize + i];
-            if (n > 0) delta_decode_row_u16 (buf + off, n);
+            if (n > 0) delta_decode_row_u16 (dst + off, src + off, n);
             off += (size_t) n * 2u;
         }
     }
@@ -339,7 +364,7 @@ delta_decode_sorted_layout (
         {
             if (channels[i].bytes_per_element != 4) continue;
             uint64_t const n = num_samples_grid[h * channelsSize + i];
-            if (n > 0) delta_decode_row_u32 (buf + off, n);
+            if (n > 0) delta_decode_row_u32 (dst + off, src + off, n);
             off += (size_t) n * 4u;
         }
     }
@@ -432,6 +457,15 @@ sort2_4ByteChannels_tiled (
     uint64_t splitPoint = compute_sorting_lookup (
         num_samples_grid, height, channels, channelsSize, sorting_lookup);
 
+    /* The packed side (readIndex) is always sequential, so we coalesce
+     * neighbouring entries whose sorted side (writeIndex) is also contiguous
+     * into a single memcpy. Half-before-float multi-row data collapses to two
+     * memcpys per row; the height==1 half-before-float (identity) layout to a
+     * single memcpy; arbitrary orderings fall back to per-channel copies. */
+    uint64_t run_read_start  = 0;
+    uint64_t run_write_start = 0;
+    size_t   run_len         = 0;
+
     uint64_t line_start_read = 0;
     for (int h = 0; h < height; ++h)
     {
@@ -446,14 +480,41 @@ sort2_4ByteChannels_tiled (
                 (size_t) n_hi * (size_t) channels[i].bytes_per_element;
             if (bitSize > 0)
             {
-                if (forward)
-                    memcpy (outPtr + writeIndex, inPtr + readIndex, bitSize);
+                if (run_len > 0 && writeIndex == run_write_start + run_len &&
+                    readIndex == run_read_start + run_len)
+                {
+                    run_len += bitSize;
+                }
                 else
-                    memcpy (outPtr + readIndex, inPtr + writeIndex, bitSize);
+                {
+                    if (run_len > 0)
+                    {
+                        if (forward)
+                            memcpy (
+                                outPtr + run_write_start,
+                                inPtr + run_read_start,
+                                run_len);
+                        else
+                            memcpy (
+                                outPtr + run_read_start,
+                                inPtr + run_write_start,
+                                run_len);
+                    }
+                    run_read_start  = readIndex;
+                    run_write_start = writeIndex;
+                    run_len         = bitSize;
+                }
             }
             row_byte_off += bitSize;
         }
         line_start_read += row_byte_off;
+    }
+    if (run_len > 0)
+    {
+        if (forward)
+            memcpy (outPtr + run_write_start, inPtr + run_read_start, run_len);
+        else
+            memcpy (outPtr + run_read_start, inPtr + run_write_start, run_len);
     }
 
     return splitPoint;
@@ -897,14 +958,19 @@ exr_zstd_encode_store_raw_chunk (exr_encode_pipeline_t* encode, size_t packed)
  *   zstd_inner_read_shuffled_segment reads each one and unshuffles into the target buffer.
  */
 
-/** Run delta (if pipe.apply_delta) on the already-sorted buffer, then shuffle
- *  into the inner stream, then ZSTD-compress into dst. Returns 0 on success
- *  and writes the total bytes produced (header + ZSTD payload) to *out_total.
- *  Note: when pipe.apply_delta is true, this MUTATES sorted_buf in place. */
+/** Run delta (if pipe.apply_delta) into work_buf, then shuffle work_buf into the
+ *  inner stream, then ZSTD-compress into dst. Returns 0 on success and writes
+ *  the total bytes produced (header + ZSTD payload) to *out_total.
+ *
+ *  Delta is out-of-place: it reads delta_src and writes work_buf (pass
+ *  delta_src == work_buf for in-place). When delta is disabled, work_buf must
+ *  already hold the sorted bytes to shuffle and delta_src is ignored; in that
+ *  case work_buf is only read, so it may alias a read-only source buffer. */
 static int
 exr_zstd_encode_one_wire_version (
     const exr_zstd_pack_pipeline*    pipe,
-    uint8_t*                         sorted_buf,
+    uint8_t*                         work_buf,
+    const uint8_t*                   delta_src,
     uint64_t                         splitPos,
     size_t                           packed,
     const uint64_t*                  channel_sample_count_grid,
@@ -921,7 +987,8 @@ exr_zstd_encode_one_wire_version (
     if (pipe->apply_delta)
     {
         if (delta_encode_sorted_layout (
-                sorted_buf,
+                work_buf,
+                delta_src,
                 splitPos,
                 packed,
                 channel_sample_count_grid,
@@ -945,7 +1012,7 @@ exr_zstd_encode_one_wire_version (
                 inner,
                 &inner_pos,
                 inner_cap,
-                (const char*) (sorted_buf + seg_off),
+                (const char*) (work_buf + seg_off),
                 (size_t) seg_lens[s],
                 seg_els[s]) != 0)
             return -1;
@@ -1083,29 +1150,76 @@ internal_exr_apply_zstd (exr_encode_pipeline_t* encode)
 
     exr_zstd_pack_pipeline pipe;
     exr_zstd_build_encode_pipeline_sorted (&pipe);
-    exr_result_t arv = internal_encode_alloc_buffer (
-        encode,
-        EXR_TRANSCODE_BUFFER_SCRATCH1,
-        &encode->scratch_buffer_1,
-        &encode->scratch_alloc_size_1,
-        encode->packed_bytes);
-    if (arv != EXR_ERR_SUCCESS) return arv;
-    /* Sort always runs before shuffle/ZSTD. */
-    uint64_t const splitPos = sort2_4ByteChannels_tiled (
-        (const char*) encode->packed_buffer,
-        channel_sample_count_grid,
-        pack_channels,
-        pack_channel_count,
-        true,
-        pipeline_height,
-        (char*) encode->scratch_buffer_1,
-        sorting_lookup);
+
+    bool const identity = exr_zstd_layout_is_identity (
+        pack_channels, pack_channel_count, pipeline_height);
+
+    uint64_t       splitPos;
+    uint8_t*       work_buf;
+    const uint8_t* delta_src;
+
+    if (identity)
+    {
+        /* packed == sorted, so sort2 would be a pure copy. splitPos is still
+         * needed for the shuffle segment layout. */
+        splitPos = compute_sorting_lookup (
+            channel_sample_count_grid,
+            pipeline_height,
+            pack_channels,
+            pack_channel_count,
+            sorting_lookup);
+
+        if (pipe.apply_delta)
+        {
+            /* Fold the otherwise-needed sort copy into the delta pass: delta
+             * reads packed and writes scratch; packed_buffer stays untouched. */
+            exr_result_t arv = internal_encode_alloc_buffer (
+                encode,
+                EXR_TRANSCODE_BUFFER_SCRATCH1,
+                &encode->scratch_buffer_1,
+                &encode->scratch_alloc_size_1,
+                encode->packed_bytes);
+            if (arv != EXR_ERR_SUCCESS) return arv;
+            work_buf  = (uint8_t*) encode->scratch_buffer_1;
+            delta_src = (const uint8_t*) encode->packed_buffer;
+        }
+        else
+        {
+            /* Shuffle reads packed_buffer directly; no scratch needed. The wire
+             * stage only reads work_buf when delta is off. */
+            work_buf  = (uint8_t*) encode->packed_buffer;
+            delta_src = work_buf;
+        }
+    }
+    else
+    {
+        exr_result_t arv = internal_encode_alloc_buffer (
+            encode,
+            EXR_TRANSCODE_BUFFER_SCRATCH1,
+            &encode->scratch_buffer_1,
+            &encode->scratch_alloc_size_1,
+            encode->packed_bytes);
+        if (arv != EXR_ERR_SUCCESS) return arv;
+        /* Sort always runs before shuffle/ZSTD. */
+        splitPos = sort2_4ByteChannels_tiled (
+            (const char*) encode->packed_buffer,
+            channel_sample_count_grid,
+            pack_channels,
+            pack_channel_count,
+            true,
+            pipeline_height,
+            (char*) encode->scratch_buffer_1,
+            sorting_lookup);
+        work_buf  = (uint8_t*) encode->scratch_buffer_1;
+        delta_src = work_buf; /* delta runs in place on the scratch buffer */
+    }
 
     uint64_t total_w = 0;
 
     if (exr_zstd_encode_one_wire_version (
             &pipe,
-            (uint8_t*) encode->scratch_buffer_1,
+            work_buf,
+            delta_src,
             splitPos,
             packed,
             channel_sample_count_grid,
@@ -1270,16 +1384,28 @@ exr_undo_zstd_v1 (
     int const n_inner =
         exr_zstd_segment_layout (split, uncompressed_size, inner_lens, inner_els);
 
-    /* Sort and shuffle always run: unshuffle into scratch, then inverse-sort
-     * back into uncompressed_data. */
-    exr_result_t drv = internal_decode_alloc_buffer (
-        decode,
-        EXR_TRANSCODE_BUFFER_SCRATCH1,
-        &decode->scratch_buffer_1,
-        &decode->scratch_alloc_size_1,
-        uncompressed_size);
-    if (drv != EXR_ERR_SUCCESS) return drv;
-    void* target = decode->scratch_buffer_1;
+    bool const identity = exr_zstd_layout_is_identity (
+        pack_channels, pack_channel_count, decode->chunk.height);
+
+    /* Shuffle always runs (unshuffle into target). The inverse sort follows
+     * unless the layout is the identity, in which case sorted == packed and we
+     * unshuffle straight into uncompressed_data, skipping the scratch buffer. */
+    void* target;
+    if (identity)
+    {
+        target = uncompressed_data;
+    }
+    else
+    {
+        exr_result_t drv = internal_decode_alloc_buffer (
+            decode,
+            EXR_TRANSCODE_BUFFER_SCRATCH1,
+            &decode->scratch_buffer_1,
+            &decode->scratch_alloc_size_1,
+            uncompressed_size);
+        if (drv != EXR_ERR_SUCCESS) return drv;
+        target = decode->scratch_buffer_1;
+    }
 
     const uint8_t*       q    = (const uint8_t*) tls_dec->shuffle_buf;
     const uint8_t* const qend = (const uint8_t*) tls_dec->shuffle_buf + dSize;
@@ -1297,8 +1423,11 @@ exr_undo_zstd_v1 (
 
     if (pipe.apply_delta)
     {
+        /* In place (dst == src): on the identity path this operates directly on
+         * uncompressed_data, otherwise on the scratch buffer. */
         if (delta_decode_sorted_layout (
                 (uint8_t*) target,
+                (const uint8_t*) target,
                 split,
                 (size_t) uncompressed_size,
                 channel_sample_count_grid,
@@ -1308,15 +1437,16 @@ exr_undo_zstd_v1 (
             return EXR_ERR_CORRUPT_CHUNK;
     }
 
-    sort2_4ByteChannels_tiled (
-        (char*) decode->scratch_buffer_1,
-        channel_sample_count_grid,
-        pack_channels,
-        pack_channel_count,
-        false,
-        decode->chunk.height,
-        (char*) uncompressed_data,
-        sorting_lookup);
+    if (!identity)
+        sort2_4ByteChannels_tiled (
+            (char*) decode->scratch_buffer_1,
+            channel_sample_count_grid,
+            pack_channels,
+            pack_channel_count,
+            false,
+            decode->chunk.height,
+            (char*) uncompressed_data,
+            sorting_lookup);
 
     return EXR_ERR_SUCCESS;
 }
