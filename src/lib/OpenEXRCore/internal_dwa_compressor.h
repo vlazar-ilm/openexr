@@ -1394,7 +1394,7 @@ DwaCompressor_initializeBuffers (DwaCompressor* me, size_t* bufferSize)
 
                 maxOutBufferSize += std_max (
                     2lu * maxLossyDctAcSize + 65536lu,
-                    exr_compress_max_buffer_size (maxLossyDctAcSize));
+                    internal_exr_deflate_bound (maxLossyDctAcSize));
                 numLossyDctChans++;
                 break;
 
@@ -1429,13 +1429,13 @@ DwaCompressor_initializeBuffers (DwaCompressor* me, size_t* bufferSize)
     // which could take slightly more space
     //
 
-    maxOutBufferSize += exr_compress_max_buffer_size (rleBufferSize);
+    maxOutBufferSize += internal_exr_deflate_bound (rleBufferSize);
 
     //
     // And the same goes for the UNKNOWN data
     //
 
-    maxOutBufferSize += exr_compress_max_buffer_size (unknownBufferSize);
+    maxOutBufferSize += internal_exr_deflate_bound (unknownBufferSize);
 
     //
     // Reserve space big enough to hold the DC data
@@ -1444,7 +1444,7 @@ DwaCompressor_initializeBuffers (DwaCompressor* me, size_t* bufferSize)
     //
 
     maxOutBufferSize +=
-        exr_compress_max_buffer_size (maxLossyDctDcSize * numLossyDctChans);
+        internal_exr_deflate_bound (maxLossyDctDcSize * numLossyDctChans);
 
     //
     // We also need to reserve space at the head of the buffer to

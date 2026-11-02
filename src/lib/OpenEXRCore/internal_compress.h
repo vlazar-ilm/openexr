@@ -42,4 +42,10 @@ exr_result_t internal_exr_apply_ht (exr_encode_pipeline_t* encode);
 #endif
 
 exr_result_t internal_exr_apply_zstd (exr_encode_pipeline_t* encode);
+
+/* Upper bound on the size of a zlib stream of in_bytes (an empty input
+ * still produces a few bytes of header and footer). Unlike exr_compress_max_buffer_size it does not also reserve room
+ * for the Huffman coder's working tables, so it is a bound on the output
+ * only. */
+size_t internal_exr_deflate_bound (size_t in_bytes);
 #endif /* OPENEXR_CORE_COMPRESS_H */

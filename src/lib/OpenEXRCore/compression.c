@@ -78,6 +78,16 @@ static inline int strcasecmp (const char* a, const char* b)
 /**************************************/
 
 size_t
+internal_exr_deflate_bound (size_t in_bytes)
+{
+    size_t r = libdeflate_zlib_compress_bound (NULL, in_bytes);
+
+    /* same slack exr_compress_max_buffer_size adds for libdeflate's output */
+    if (r > (SIZE_MAX - 9)) return (size_t) (SIZE_MAX);
+    return r + 9;
+}
+
+size_t
 exr_compress_max_buffer_size (size_t in_bytes)
 {
     size_t r, extra;
