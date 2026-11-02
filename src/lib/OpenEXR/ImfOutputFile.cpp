@@ -176,6 +176,10 @@ struct OutputFile::Data
     inline LineBuffer* getLineBuffer (int number); // hash function from line
                                                    // buffer indices into our
                                                    // vector of line buffers
+
+    void releaseLineBuffers (); // free the line buffers (and their
+                                // compressors) once all pixel data
+                                // has been written
 };
 
 OutputFile::Data::Data (int numThreads)
@@ -192,15 +196,24 @@ OutputFile::Data::Data (int numThreads)
     lineBuffers.resize (max (1, 2 * numThreads));
 }
 
-OutputFile::Data::~Data ()
+OutputFile::Data::~Data () { releaseLineBuffers (); }
+
+void
+OutputFile::Data::releaseLineBuffers ()
 {
     for (size_t i = 0; i < lineBuffers.size (); i++)
         delete lineBuffers[i];
+
+    lineBuffers.clear ();
 }
 
 LineBuffer*
 OutputFile::Data::getLineBuffer (int number)
 {
+    if (lineBuffers.empty ())
+        throw IEX_NAMESPACE::LogicExc (
+            "Line buffers were released after all pixel data was written.");
+
     return lineBuffers[number % lineBuffers.size ()];
 }
 
@@ -995,6 +1008,11 @@ OutputFile::writePixels (int numScanLines)
             throw IEX_NAMESPACE::ArgExc (
                 "No frame buffer specified as pixel data source.");
 
+        if (_data->missingScanLines <= 0)
+            throw IEX_NAMESPACE::ArgExc (
+                "Tried to write more scan lines "
+                "than specified by the data window.");
+
         //
         // Maintain two iterators:
         //     nextWriteBuffer: next linebuffer to be written to the file
@@ -1218,6 +1236,14 @@ OutputFile::writePixels (int numScanLines)
         }
 
         if (exception) throw IEX_NAMESPACE::IoExc (*exception);
+
+        //
+        // All pixel data has been written, so the line buffers and
+        // their compressors will never be used again. Free them now
+        // instead of holding on to them until the file is closed.
+        //
+
+        if (_data->missingScanLines <= 0) _data->releaseLineBuffers ();
     }
     catch (IEX_NAMESPACE::BaseExc& e)
     {
@@ -1361,6 +1387,8 @@ OutputFile::copyPixels (InputFile& in)
 
         _data->missingScanLines -= _data->linesInBuffer;
     }
+
+    _data->releaseLineBuffers ();
 }
 
 void

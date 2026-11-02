@@ -217,6 +217,9 @@ struct TiledOutputFile::Data
     vector<TileBuffer*> tileBuffers;
     size_t              tileBufferSize; // size of a tile buffer
 
+    int numTilesTotal;   // number of tiles in the file, over all levels
+    int numTilesWritten; // number of tiles written to the file so far
+
     uint64_t tileOffsetsPosition; // position of the tile index
 
     TileMap   tileMap;
@@ -237,6 +240,10 @@ struct TiledOutputFile::Data
     // buffer coords into our
     // vector of tile buffers
 
+    void releaseTileBuffers (); // free the tile buffers (and their
+                                // compressors) once all tiles have
+                                // been written
+
     TileCoord nextTileCoord (const TileCoord& a);
 };
 
@@ -244,6 +251,8 @@ TiledOutputFile::Data::Data (int numThreads)
     : multipart (false)
     , numXTiles (0)
     , numYTiles (0)
+    , numTilesTotal (0)
+    , numTilesWritten (0)
     , tileOffsetsPosition (0)
     , partNumber (-1)
 {
@@ -267,13 +276,25 @@ TiledOutputFile::Data::~Data ()
     for (TileMap::iterator i = tileMap.begin (); i != tileMap.end (); ++i)
         delete i->second;
 
+    releaseTileBuffers ();
+}
+
+void
+TiledOutputFile::Data::releaseTileBuffers ()
+{
     for (size_t i = 0; i < tileBuffers.size (); i++)
         delete tileBuffers[i];
+
+    tileBuffers.clear ();
 }
 
 TileBuffer*
 TiledOutputFile::Data::getTileBuffer (int number)
 {
+    if (tileBuffers.empty ())
+        throw IEX_NAMESPACE::LogicExc (
+            "Tile buffers were released after all tiles were written.");
+
     return tileBuffers[number % tileBuffers.size ()];
 }
 
@@ -406,6 +427,7 @@ writeTileData (
     if (currentPosition == 0) currentPosition = streamData->os->tellp ();
 
     ofd->tileOffsets (dx, dy, lx, ly) = currentPosition;
+    ofd->numTilesWritten++;
 
 #ifdef DEBUG
     assert (streamData->os->tellp () == currentPosition);
@@ -988,6 +1010,34 @@ TiledOutputFile::initialize (const Header& header)
         _data->numYLevels);
 
     //
+    // Count the tiles in the file, so we know when all of them
+    // have been written and the tile buffers are no longer needed.
+    //
+
+    _data->numTilesTotal = 0;
+
+    switch (_data->tileDesc.mode)
+    {
+        case ONE_LEVEL:
+        case MIPMAP_LEVELS:
+
+            for (int i = 0; i < _data->numXLevels; ++i)
+                _data->numTilesTotal +=
+                    _data->numXTiles[i] * _data->numYTiles[i];
+            break;
+
+        case RIPMAP_LEVELS:
+
+            for (int ly = 0; ly < _data->numYLevels; ++ly)
+                for (int lx = 0; lx < _data->numXLevels; ++lx)
+                    _data->numTilesTotal +=
+                        _data->numXTiles[lx] * _data->numYTiles[ly];
+            break;
+
+        default: break;
+    }
+
+    //
     // Determine the first tile coordinate that we will be writing
     // if the file is not RANDOM_Y.
     //
@@ -1199,6 +1249,11 @@ TiledOutputFile::writeTiles (int dx1, int dx2, int dy1, int dy2, int lx, int ly)
             throw IEX_NAMESPACE::ArgExc ("No frame buffer specified "
                                          "as pixel data source.");
 
+        if (_data->tileBuffers.empty ())
+            throw IEX_NAMESPACE::ArgExc (
+                "Attempt to write tiles more than once: "
+                "all tiles have already been written.");
+
         if (!isValidTile (dx1, dy1, lx, ly) || !isValidTile (dx2, dy2, lx, ly))
             throw IEX_NAMESPACE::ArgExc ("Tile coordinates are invalid.");
 
@@ -1381,6 +1436,15 @@ TiledOutputFile::writeTiles (int dx1, int dx2, int dy1, int dy2, int lx, int ly)
         }
 
         if (exception) throw IEX_NAMESPACE::IoExc (*exception);
+
+        //
+        // All tiles have been written, so the tile buffers and their
+        // compressors will never be used again. Free them now instead
+        // of holding on to them until the file is closed.
+        //
+
+        if (_data->numTilesWritten >= _data->numTilesTotal)
+            _data->releaseTileBuffers ();
     }
     catch (IEX_NAMESPACE::BaseExc& e)
     {
@@ -1591,6 +1655,8 @@ TiledOutputFile::copyPixels (TiledInputFile& in)
                 _data->nextTileCoord (_data->nextTileToWrite);
         }
     }
+
+    _data->releaseTileBuffers ();
 }
 
 void

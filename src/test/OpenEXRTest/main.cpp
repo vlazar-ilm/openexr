@@ -43,6 +43,7 @@
 #include "testMultiPartFileMixingBasic.h"
 #include "testMultiPartSharedAttributes.h"
 #include "testMultiPartThreading.h"
+#include "testReleaseBuffers.h"
 #include "testMultiScanlinePartThreading.h"
 #include "testMultiTiledPartThreading.h"
 #include "testMultiView.h"
@@ -238,6 +239,7 @@ main (int argc, char* argv[])
     TEST (testMultiScanlinePartThreading, "multi");
     TEST (testMultiTiledPartThreading, "multi");
     TEST (testMultiPartThreading, "multi");
+    TEST (testReleaseBuffers, "multi");
     TEST (testMultiPartApi, "multi");
     TEST (testMultiPartSharedAttributes, "multi");
     TEST (testCopyMultiPartFile, "multi");

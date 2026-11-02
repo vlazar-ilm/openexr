@@ -87,6 +87,8 @@ add_executable(OpenEXRTest
   testMultiScanlinePartThreading.h
   testMultiTiledPartThreading.cpp
   testMultiTiledPartThreading.h
+  testReleaseBuffers.cpp
+  testReleaseBuffers.h
   testMultiView.cpp
   testMultiView.h
   testNativeFormat.cpp
@@ -191,6 +193,7 @@ define_openexr_tests(
  testMultiPartThreading
  testMultiScanlinePartThreading
  testMultiTiledPartThreading
+ testReleaseBuffers
  testMultiView
  testNativeFormat
  testOptimizedInterleavePatterns
